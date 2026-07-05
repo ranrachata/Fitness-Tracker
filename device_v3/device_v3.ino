@@ -12,14 +12,37 @@
 #define BUZZER_PIN    5
 #define BUTTON_PIN    10
 
-#define GYRO_X_THRESHOLD  100.0   // °/s
-#define GYRO_Z_THRESHOLD  100.0   // °/s
+// ── Push-up thresholds ──────────────────────────────────────────────────────
+// Device: flat on upper back, face-down.
+// az ≈ +1.0 g at top (arms extended); drops below DOWN when chest nears floor.
+#define PUSHUP_DOWN_THR   1.2f   // az < this  → "down" phase detected
+#define PUSHUP_UP_THR     1.3f   // az > this  → "up" phase detected → count
+
+// ── Sit-up thresholds ───────────────────────────────────────────────────────
+// Device: flat on chest/abdomen.
+// |ay| ≈ 0 when lying flat; rises toward 1 g when torso is upright.
+#define SITUP_UP_THR      0.60f   // |ay| > this → "up" phase detected
+#define SITUP_DOWN_THR    0.25f   // |ay| < this → back to flat → count
+
+#define MIN_REP_MS  600           // minimum ms between counted reps (debounce)
+#define SMOOTH_A    0.25f         // EMA smoothing factor (0 = no update, 1 = raw)
+
+// ── State ───────────────────────────────────────────────────────────────────
+enum Mode     { PUSHUP, SITUP };
+enum RepState { WAIT_DOWN, WAIT_UP };
+
+Mode          mode      = PUSHUP;
+RepState      repState  = WAIT_DOWN;   // push-up starts waiting for DOWN first
+int           repCount  = 0;
+bool          lastBtn   = HIGH;
+unsigned long lastRepTime = 0;
+
+float smoothAz = 1.0f;   // initial estimate: device lying flat (az = 1 g)
+float smoothAy = 0.0f;
 
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
-bool useZAxis = false;          // false = X axis, true = Z axis
-bool lastButtonState = HIGH;
-
+// ── I2C / hardware helpers ───────────────────────────────────────────────────
 void i2c_clear_bus() {
   pinMode(SCL_PIN, OUTPUT);
   pinMode(SDA_PIN, INPUT_PULLUP);
@@ -61,18 +84,19 @@ void readMPU(float &ax, float &ay, float &az,
   int16_t rawAx = Wire.read() << 8 | Wire.read();
   int16_t rawAy = Wire.read() << 8 | Wire.read();
   int16_t rawAz = Wire.read() << 8 | Wire.read();
-  Wire.read(); Wire.read();
+  Wire.read(); Wire.read();  // skip temperature
   int16_t rawGx = Wire.read() << 8 | Wire.read();
   int16_t rawGy = Wire.read() << 8 | Wire.read();
   int16_t rawGz = Wire.read() << 8 | Wire.read();
-  ax = rawAx / 16384.0;
-  ay = rawAy / 16384.0;
-  az = rawAz / 16384.0;
-  gx = rawGx / 131.0;
-  gy = rawGy / 131.0;
-  gz = rawGz / 131.0;
+  ax = rawAx / 16384.0f;
+  ay = rawAy / 16384.0f;
+  az = rawAz / 16384.0f;
+  gx = rawGx / 131.0f;
+  gy = rawGy / 131.0f;
+  gz = rawGz / 131.0f;
 }
 
+// ── Setup ────────────────────────────────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
   pinMode(BUZZER_PIN, OUTPUT);
@@ -89,59 +113,95 @@ void setup() {
   Serial.println("Ready");
 }
 
+// ── Loop ─────────────────────────────────────────────────────────────────────
 void loop() {
-  // Button toggle (debounced on falling edge)
-  bool btnState = digitalRead(BUTTON_PIN);
-  if (btnState == LOW && lastButtonState == HIGH) {
-    useZAxis = !useZAxis;
-    delay(50); // debounce
+  // ── Button: toggle mode + reset ──────────────────────────────────────────
+  bool btn = digitalRead(BUTTON_PIN);
+  if (btn == LOW && lastBtn == HIGH) {
+    delay(50);  // debounce
+    mode      = (mode == PUSHUP) ? SITUP : PUSHUP;
+    repCount  = 0;
+    repState  = WAIT_DOWN;
+    smoothAz  = 1.0f;
+    smoothAy  = 0.0f;
+    lastRepTime = 0;
   }
-  lastButtonState = btnState;
+  lastBtn = btn;
 
+  // ── I2C watchdog ─────────────────────────────────────────────────────────
   Wire.beginTransmission(OLED_ADDR);
   if (Wire.endTransmission() != 0) {
     if (!initAll()) { delay(500); return; }
   }
 
+  // ── Read & smooth sensor ─────────────────────────────────────────────────
   float ax, ay, az, gx, gy, gz;
   readMPU(ax, ay, az, gx, gy, gz);
+  smoothAz = SMOOTH_A * az + (1.0f - SMOOTH_A) * smoothAz;
+  smoothAy = SMOOTH_A * ay + (1.0f - SMOOTH_A) * smoothAy;
 
-  bool triggered = useZAxis ? (abs(gz) > GYRO_Z_THRESHOLD)
-                             : (abs(gx) > GYRO_X_THRESHOLD);
+  unsigned long now     = millis();
+  bool          counted = false;
 
-  if (triggered) {
-    tone(BUZZER_PIN, 1500, 80);
+  // ── Rep detection ─────────────────────────────────────────────────────────
+  if (mode == PUSHUP) {
+    // Sequence: arms-up (az~1) → chest-down (az<0.75) → push-up (az>1.15) → count
+    if (repState == WAIT_DOWN && smoothAz < PUSHUP_DOWN_THR) {
+      repState = WAIT_UP;
+    } else if (repState == WAIT_UP && smoothAz > PUSHUP_UP_THR) {
+      if (now - lastRepTime > MIN_REP_MS) {
+        repCount++;
+        lastRepTime = now;
+        counted = true;
+      }
+      repState = WAIT_DOWN;
+    }
+  } else {  // SITUP
+    // Sequence: lying (|ay|~0) → sit-up (|ay|>0.6) → lie back (|ay|<0.25) → count
+    if (repState == WAIT_UP && abs(smoothAy) > SITUP_UP_THR) {
+      repState = WAIT_DOWN;
+    } else if (repState == WAIT_DOWN && abs(smoothAy) < SITUP_DOWN_THR) {
+      if (now - lastRepTime > MIN_REP_MS) {
+        repCount++;
+        lastRepTime = now;
+        counted = true;
+      }
+      repState = WAIT_UP;
+    }
   }
 
+  if (counted) {
+    tone(BUZZER_PIN, 1800, 120);
+  }
+
+  // ── Display ──────────────────────────────────────────────────────────────
   display.clearDisplay();
   display.setTextColor(SSD1306_WHITE);
+
+  // Mode header
   display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.print(mode == PUSHUP ? "  >> PUSH-UP <<  " : "  >>  SIT-UP <<  ");
 
-  display.setCursor(25, 0);
-  display.print("=  MPU-6050  =");
+  // Big rep counter (centred)
+  display.setTextSize(4);
+  int cx = (repCount < 10)  ? 52 :
+           (repCount < 100) ? 28 : 4;
+  display.setCursor(cx, 14);
+  display.print(repCount);
 
-  display.setCursor(0,  12); display.print("Acc (g)");
-  display.setCursor(72, 12); display.print("Gyro(d/s)");
-  display.drawFastVLine(66, 10, 44, SSD1306_WHITE);
-
-  display.setCursor(0, 23); display.printf("X %+.2f", ax);
-  display.setCursor(0, 33); display.printf("Y %+.2f", ay);
-  display.setCursor(0, 43); display.printf("Z %+.2f", az);
-
-  display.setCursor(72, 23); display.printf("%+6.1f", gx);
-  display.setCursor(72, 33); display.printf("%+6.1f", gy);
-  display.setCursor(72, 43); display.printf("%+6.1f", gz);
-
+  // Status line: live sensor value + what we're waiting for
+  display.setTextSize(1);
   display.setCursor(0, 56);
-  if (useZAxis) {
-    if (triggered) display.printf("** Gz %.0f d/s **", gz);
-    else           display.printf("   Gz %.0f d/s   ", gz);
+  if (mode == PUSHUP) {
+    display.printf("az:%.2f  wait:%s", smoothAz,
+                   repState == WAIT_DOWN ? "DOWN" : "UP  ");
   } else {
-    if (triggered) display.printf("** Gx %.0f d/s **", gx);
-    else           display.printf("   Gx %.0f d/s   ", gx);
+    display.printf("ay:%.2f  wait:%s", smoothAy,
+                   repState == WAIT_UP   ? "UP  " : "DOWN");
   }
 
   display.display();
-  delay(80);
+  delay(50);
   yield();
 }
