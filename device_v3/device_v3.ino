@@ -1,7 +1,16 @@
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
+#include <WiFi.h>
+#include <PubSubClient.h>
 
+// ── WiFi / MQTT config ────────────────────────────────────────────────────────
+#define WIFI_SSID     "ranrachata"
+#define WIFI_PASS     "29Nov2009"
+#define MQTT_SERVER   "13.213.18.235"
+#define MQTT_PORT     1883
+
+// ── Hardware pins ─────────────────────────────────────────────────────────────
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
 #define OLED_RESET    -1
@@ -12,37 +21,95 @@
 #define BUZZER_PIN    5
 #define BUTTON_PIN    10
 
-// ── Push-up thresholds ──────────────────────────────────────────────────────
+// ── Push-up thresholds ────────────────────────────────────────────────────────
 // Device: flat on upper back, face-down.
-// az ≈ +1.0 g at top (arms extended); drops below DOWN when chest nears floor.
-#define PUSHUP_DOWN_THR   1.2f   // az < this  → "down" phase detected
-#define PUSHUP_UP_THR     1.3f   // az > this  → "up" phase detected → count
+#define PUSHUP_DOWN_THR   0.85f
+#define PUSHUP_UP_THR     1.05f
 
-// ── Sit-up thresholds ───────────────────────────────────────────────────────
+// ── Sit-up thresholds ─────────────────────────────────────────────────────────
 // Device: flat on chest/abdomen.
-// |ay| ≈ 0 when lying flat; rises toward 1 g when torso is upright.
-#define SITUP_UP_THR      0.60f   // |ay| > this → "up" phase detected
-#define SITUP_DOWN_THR    0.25f   // |ay| < this → back to flat → count
+#define SITUP_UP_THR      0.60f
+#define SITUP_DOWN_THR    0.25f
 
-#define MIN_REP_MS  600           // minimum ms between counted reps (debounce)
-#define SMOOTH_A    0.25f         // EMA smoothing factor (0 = no update, 1 = raw)
+#define MIN_REP_MS  600
+#define SMOOTH_A    0.25f
 
-// ── State ───────────────────────────────────────────────────────────────────
+// ── State ─────────────────────────────────────────────────────────────────────
 enum Mode     { PUSHUP, SITUP };
 enum RepState { WAIT_DOWN, WAIT_UP };
 
 Mode          mode      = PUSHUP;
-RepState      repState  = WAIT_DOWN;   // push-up starts waiting for DOWN first
+RepState      repState  = WAIT_DOWN;
 int           repCount  = 0;
 bool          lastBtn   = HIGH;
-unsigned long lastRepTime = 0;
+unsigned long lastRepTime   = 0;
+unsigned long lastMqttRetry = 0;
 
-float smoothAz = 1.0f;   // initial estimate: device lying flat (az = 1 g)
+float smoothAz = 1.0f;
 float smoothAy = 0.0f;
 
+String mqttTopic;   // "situp/<device_id>"
+String deviceId;
+
+WiFiClient   wifiClient;
+PubSubClient mqtt(wifiClient);
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
-// ── I2C / hardware helpers ───────────────────────────────────────────────────
+// ── Network helpers ───────────────────────────────────────────────────────────
+void connectWifi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+
+  unsigned long t = millis();
+  int frame = 0;
+  while (WiFi.status() != WL_CONNECTED && millis() - t < 12000) {
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setCursor(0, 0);  display.print("Connecting WiFi");
+    display.setCursor(0, 12); display.print(WIFI_SSID);
+    display.setCursor(0, 26);
+    for (int i = 0; i <= (frame % 4); i++) display.print(".");
+    display.setCursor(0, 40);
+    display.printf("%.1fs", (millis() - t) / 1000.0f);
+    display.display();
+    frame++;
+    delay(400);
+  }
+
+  display.clearDisplay();
+  display.setTextSize(1);
+  if (WiFi.status() == WL_CONNECTED) {
+    display.setCursor(0, 0);  display.print("WiFi Connected!");
+    display.setCursor(0, 14); display.print(WiFi.localIP().toString());
+  } else {
+    display.setCursor(0, 0);  display.print("WiFi FAILED");
+    display.setCursor(0, 14); display.print("Running offline");
+  }
+  display.display();
+  delay(1800);
+}
+
+void reconnectMQTT() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  if (mqtt.connected()) return;
+  unsigned long now = millis();
+  if (now - lastMqttRetry < 5000) return;
+  lastMqttRetry = now;
+  mqtt.connect(deviceId.c_str());
+}
+
+void publishState() {
+  if (!mqtt.connected()) return;
+  char payload[80];
+  snprintf(payload, sizeof(payload),
+           "{\"device\":\"%s\",\"mode\":\"%s\",\"count\":%d}",
+           deviceId.c_str(),
+           mode == PUSHUP ? "PUSH-UP" : "SIT-UP",
+           repCount);
+  mqtt.publish(mqttTopic.c_str(), payload, true);  // retained
+}
+
+// ── I2C / hardware helpers ────────────────────────────────────────────────────
 void i2c_clear_bus() {
   pinMode(SCL_PIN, OUTPUT);
   pinMode(SDA_PIN, INPUT_PULLUP);
@@ -96,13 +163,14 @@ void readMPU(float &ax, float &ay, float &az,
   gz = rawGz / 131.0f;
 }
 
-// ── Setup ────────────────────────────────────────────────────────────────────
+// ── Setup ─────────────────────────────────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
   pinMode(BUZZER_PIN, OUTPUT);
   digitalWrite(BUZZER_PIN, LOW);
   pinMode(BUTTON_PIN, INPUT_PULLUP);
-  delay(1000);
+
+  delay(500);
   i2c_clear_bus();
   Wire.begin(SDA_PIN, SCL_PIN);
   Wire.setClock(100000);
@@ -110,21 +178,38 @@ void setup() {
     Serial.println("OLED failed"); for (;;) yield();
   }
   initMPU();
-  Serial.println("Ready");
+
+  // WiFi + derive device ID from MAC
+  connectWifi();
+  String mac = WiFi.macAddress();   // "AA:BB:CC:DD:EE:FF"
+  mac.replace(":", "");
+  deviceId  = "esp32_" + mac.substring(6);  // last 6 hex chars
+  mqttTopic = "situp/" + deviceId;
+
+  mqtt.setServer(MQTT_SERVER, MQTT_PORT);
+  mqtt.setKeepAlive(30);
+  reconnectMQTT();
+
+  Serial.printf("Device: %s  Topic: %s\n",
+                deviceId.c_str(), mqttTopic.c_str());
 }
 
-// ── Loop ─────────────────────────────────────────────────────────────────────
+// ── Loop ──────────────────────────────────────────────────────────────────────
 void loop() {
+  mqtt.loop();
+  reconnectMQTT();
+
   // ── Button: toggle mode + reset ──────────────────────────────────────────
   bool btn = digitalRead(BUTTON_PIN);
   if (btn == LOW && lastBtn == HIGH) {
-    delay(50);  // debounce
+    delay(50);
     mode      = (mode == PUSHUP) ? SITUP : PUSHUP;
     repCount  = 0;
     repState  = WAIT_DOWN;
     smoothAz  = 1.0f;
     smoothAy  = 0.0f;
     lastRepTime = 0;
+    publishState();   // announce mode change immediately
   }
   lastBtn = btn;
 
@@ -145,7 +230,6 @@ void loop() {
 
   // ── Rep detection ─────────────────────────────────────────────────────────
   if (mode == PUSHUP) {
-    // Sequence: arms-up (az~1) → chest-down (az<0.75) → push-up (az>1.15) → count
     if (repState == WAIT_DOWN && smoothAz < PUSHUP_DOWN_THR) {
       repState = WAIT_UP;
     } else if (repState == WAIT_UP && smoothAz > PUSHUP_UP_THR) {
@@ -156,8 +240,7 @@ void loop() {
       }
       repState = WAIT_DOWN;
     }
-  } else {  // SITUP
-    // Sequence: lying (|ay|~0) → sit-up (|ay|>0.6) → lie back (|ay|<0.25) → count
+  } else {
     if (repState == WAIT_UP && abs(smoothAy) > SITUP_UP_THR) {
       repState = WAIT_DOWN;
     } else if (repState == WAIT_DOWN && abs(smoothAy) < SITUP_DOWN_THR) {
@@ -172,27 +255,43 @@ void loop() {
 
   if (counted) {
     tone(BUZZER_PIN, 1800, 120);
+    publishState();
   }
 
-  // ── Display ──────────────────────────────────────────────────────────────
+  // ── Display ───────────────────────────────────────────────────────────────
   display.clearDisplay();
   display.setTextColor(SSD1306_WHITE);
+  bool wifiOk = (WiFi.status() == WL_CONNECTED);
+  bool mqttOk = mqtt.connected();
 
-  // Mode header
+  // Row 0 — mode
   display.setTextSize(1);
   display.setCursor(0, 0);
-  display.print(mode == PUSHUP ? "  >> PUSH-UP <<  " : "  >>  SIT-UP <<  ");
+  display.print(mode == PUSHUP ? " >> PUSH-UP <<" : " >>  SIT-UP <<");
 
-  // Big rep counter (centred)
-  display.setTextSize(4);
+  // Row 1 — connection status (always visible, refreshes every loop)
+  display.setCursor(0, 10);
+  display.printf("W:%s M:%s  %s",
+                 wifiOk ? "OK" : "--",
+                 mqttOk ? "OK" : "--",
+                 deviceId.c_str());
+
+  // Divider
+  display.drawFastHLine(0, 20, 128, SSD1306_WHITE);
+
+  // Row 2 — rep counter (size 3, centred)
+  display.setTextSize(3);
   int cx = (repCount < 10)  ? 52 :
-           (repCount < 100) ? 28 : 4;
-  display.setCursor(cx, 14);
+           (repCount < 100) ? 34 : 16;
+  display.setCursor(cx, 23);
   display.print(repCount);
 
-  // Status line: live sensor value + what we're waiting for
+  // Divider
+  display.drawFastHLine(0, 49, 128, SSD1306_WHITE);
+
+  // Row 3 — sensor + wait state
   display.setTextSize(1);
-  display.setCursor(0, 56);
+  display.setCursor(0, 52);
   if (mode == PUSHUP) {
     display.printf("az:%.2f  wait:%s", smoothAz,
                    repState == WAIT_DOWN ? "DOWN" : "UP  ");
