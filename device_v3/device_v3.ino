@@ -10,10 +10,15 @@
 #define SDA_PIN       6
 #define SCL_PIN       7
 #define BUZZER_PIN    5
+#define BUTTON_PIN    10
 
+#define GYRO_X_THRESHOLD  100.0   // °/s
 #define GYRO_Z_THRESHOLD  100.0   // °/s
 
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+bool useZAxis = false;          // false = X axis, true = Z axis
+bool lastButtonState = HIGH;
 
 void i2c_clear_bus() {
   pinMode(SCL_PIN, OUTPUT);
@@ -72,6 +77,7 @@ void setup() {
   Serial.begin(115200);
   pinMode(BUZZER_PIN, OUTPUT);
   digitalWrite(BUZZER_PIN, LOW);
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
   delay(1000);
   i2c_clear_bus();
   Wire.begin(SDA_PIN, SCL_PIN);
@@ -84,6 +90,14 @@ void setup() {
 }
 
 void loop() {
+  // Button toggle (debounced on falling edge)
+  bool btnState = digitalRead(BUTTON_PIN);
+  if (btnState == LOW && lastButtonState == HIGH) {
+    useZAxis = !useZAxis;
+    delay(50); // debounce
+  }
+  lastButtonState = btnState;
+
   Wire.beginTransmission(OLED_ADDR);
   if (Wire.endTransmission() != 0) {
     if (!initAll()) { delay(500); return; }
@@ -92,7 +106,8 @@ void loop() {
   float ax, ay, az, gx, gy, gz;
   readMPU(ax, ay, az, gx, gy, gz);
 
-  bool triggered = (abs(gz) > GYRO_Z_THRESHOLD);
+  bool triggered = useZAxis ? (abs(gz) > GYRO_Z_THRESHOLD)
+                             : (abs(gx) > GYRO_X_THRESHOLD);
 
   if (triggered) {
     tone(BUZZER_PIN, 1500, 80);
@@ -118,10 +133,12 @@ void loop() {
   display.setCursor(72, 43); display.printf("%+6.1f", gz);
 
   display.setCursor(0, 56);
-  if (triggered) {
-    display.printf("** Gz %.0f d/s **", gz);
+  if (useZAxis) {
+    if (triggered) display.printf("** Gz %.0f d/s **", gz);
+    else           display.printf("   Gz %.0f d/s   ", gz);
   } else {
-    display.printf("   Gz %.0f d/s   ", gz);
+    if (triggered) display.printf("** Gx %.0f d/s **", gx);
+    else           display.printf("   Gx %.0f d/s   ", gx);
   }
 
   display.display();
