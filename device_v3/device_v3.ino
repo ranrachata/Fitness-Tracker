@@ -11,7 +11,7 @@
 #define SCL_PIN       7
 #define BUZZER_PIN    5
 
-#define GYRO_X_THRESHOLD  100.0   // °/s
+#define GYRO_Z_THRESHOLD  100.0   // °/s
 
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
@@ -92,7 +92,7 @@ void loop() {
   float ax, ay, az, gx, gy, gz;
   readMPU(ax, ay, az, gx, gy, gz);
 
-  bool triggered = (abs(gx) > GYRO_X_THRESHOLD);
+  bool triggered = (abs(gz) > GYRO_Z_THRESHOLD);
 
   if (triggered) {
     tone(BUZZER_PIN, 1500, 80);
@@ -119,9 +119,9 @@ void loop() {
 
   display.setCursor(0, 56);
   if (triggered) {
-    display.printf("** Gx %.0f d/s **", gx);
+    display.printf("** Gz %.0f d/s **", gz);
   } else {
-    display.printf("   Gx %.0f d/s   ", gx);
+    display.printf("   Gz %.0f d/s   ", gz);
   }
 
   display.display();
