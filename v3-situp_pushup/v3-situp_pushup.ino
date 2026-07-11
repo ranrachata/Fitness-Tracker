@@ -23,19 +23,28 @@
 
 // ── Push-up thresholds ────────────────────────────────────────────────────────
 // Device: flat on upper back, face-down.
+// az ≈ 1g at rest; drops when chest goes down, spikes when pushing up.
 #define PUSHUP_DOWN_THR   0.85f
 #define PUSHUP_UP_THR     1.05f
 
 // ── Sit-up thresholds ─────────────────────────────────────────────────────────
-// Device: flat on chest/abdomen.
+// Device: flat on chest, lying on back.
+// |ay| ≈ 0 lying flat; rises ~1g when torso is upright.
 #define SITUP_UP_THR      0.60f
 #define SITUP_DOWN_THR    0.25f
+
+// ── Squat thresholds ──────────────────────────────────────────────────────────
+// Device: on waist/lower-back, standing upright.
+// az ≈ 1g standing; drops when body descends, spikes when driving back up.
+// Wider window than push-up because the vertical force during stand-up is higher.
+#define SQUAT_DOWN_THR    -0.80f
+#define SQUAT_UP_THR      -0.10f
 
 #define MIN_REP_MS  600
 #define SMOOTH_A    0.25f
 
 // ── State ─────────────────────────────────────────────────────────────────────
-enum Mode     { PUSHUP, SITUP };
+enum Mode     { PUSHUP, SITUP, SQUAT };   // button cycles through all three
 enum RepState { WAIT_DOWN, WAIT_UP };
 
 Mode          mode      = PUSHUP;
@@ -48,7 +57,7 @@ unsigned long lastMqttRetry = 0;
 float smoothAz = 1.0f;
 float smoothAy = 0.0f;
 
-String mqttTopic;   // "situp/<device_id>"
+String mqttTopic;
 String deviceId;
 
 WiFiClient   wifiClient;
@@ -100,13 +109,14 @@ void reconnectMQTT() {
 
 void publishState() {
   if (!mqtt.connected()) return;
+  const char* modeStr = (mode == PUSHUP) ? "PUSH-UP"
+                      : (mode == SITUP)  ? "SIT-UP"
+                      :                    "SQUAT";
   char payload[80];
   snprintf(payload, sizeof(payload),
            "{\"device\":\"%s\",\"mode\":\"%s\",\"count\":%d}",
-           deviceId.c_str(),
-           mode == PUSHUP ? "PUSH-UP" : "SIT-UP",
-           repCount);
-  mqtt.publish(mqttTopic.c_str(), payload, true);  // retained
+           deviceId.c_str(), modeStr, repCount);
+  mqtt.publish(mqttTopic.c_str(), payload, true);
 }
 
 // ── I2C / hardware helpers ────────────────────────────────────────────────────
@@ -163,6 +173,16 @@ void readMPU(float &ax, float &ay, float &az,
   gz = rawGz / 131.0f;
 }
 
+// ── Mode label helper ─────────────────────────────────────────────────────────
+const char* modeLabel() {
+  switch (mode) {
+    case PUSHUP: return " >> PUSH-UP <<";
+    case SITUP:  return " >>  SIT-UP <<";
+    case SQUAT:  return " >>  SQUAT  <<";
+  }
+  return "";
+}
+
 // ── Setup ─────────────────────────────────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
@@ -179,11 +199,10 @@ void setup() {
   }
   initMPU();
 
-  // WiFi + derive device ID from MAC
   connectWifi();
-  String mac = WiFi.macAddress();   // "AA:BB:CC:DD:EE:FF"
+  String mac = WiFi.macAddress();
   mac.replace(":", "");
-  deviceId  = "esp32_" + mac.substring(6);  // last 6 hex chars
+  deviceId  = "esp32_" + mac.substring(6);
   mqttTopic = "situp/" + deviceId;
 
   mqtt.setServer(MQTT_SERVER, MQTT_PORT);
@@ -199,17 +218,17 @@ void loop() {
   mqtt.loop();
   reconnectMQTT();
 
-  // ── Button: toggle mode + reset ──────────────────────────────────────────
+  // ── Button: cycle mode PUSHUP → SITUP → SQUAT → PUSHUP ───────────────────
   bool btn = digitalRead(BUTTON_PIN);
   if (btn == LOW && lastBtn == HIGH) {
     delay(50);
-    mode      = (mode == PUSHUP) ? SITUP : PUSHUP;
+    mode      = (Mode)((mode + 1) % 3);   // cycle through 3 modes
     repCount  = 0;
     repState  = WAIT_DOWN;
     smoothAz  = 1.0f;
     smoothAy  = 0.0f;
     lastRepTime = 0;
-    publishState();   // announce mode change immediately
+    publishState();
   }
   lastBtn = btn;
 
@@ -230,26 +249,31 @@ void loop() {
 
   // ── Rep detection ─────────────────────────────────────────────────────────
   if (mode == PUSHUP) {
+    // face-down, az: WAIT_DOWN (az<0.85) → WAIT_UP (az>1.05) → count
     if (repState == WAIT_DOWN && smoothAz < PUSHUP_DOWN_THR) {
       repState = WAIT_UP;
     } else if (repState == WAIT_UP && smoothAz > PUSHUP_UP_THR) {
-      if (now - lastRepTime > MIN_REP_MS) {
-        repCount++;
-        lastRepTime = now;
-        counted = true;
-      }
+      if (now - lastRepTime > MIN_REP_MS) { repCount++; lastRepTime = now; counted = true; }
       repState = WAIT_DOWN;
     }
-  } else {
+
+  } else if (mode == SITUP) {
+    // lying on back, ay: WAIT_UP (|ay|>0.6) → WAIT_DOWN (|ay|<0.25) → count
     if (repState == WAIT_UP && abs(smoothAy) > SITUP_UP_THR) {
       repState = WAIT_DOWN;
     } else if (repState == WAIT_DOWN && abs(smoothAy) < SITUP_DOWN_THR) {
-      if (now - lastRepTime > MIN_REP_MS) {
-        repCount++;
-        lastRepTime = now;
-        counted = true;
-      }
+      if (now - lastRepTime > MIN_REP_MS) { repCount++; lastRepTime = now; counted = true; }
       repState = WAIT_UP;
+    }
+
+  } else {  // SQUAT
+    // standing, az: WAIT_DOWN (az<0.75) → WAIT_UP (az>1.20) → count
+    // same axis as push-up but wider threshold — body drives harder when standing
+    if (repState == WAIT_DOWN && smoothAz < SQUAT_DOWN_THR) {
+      repState = WAIT_UP;
+    } else if (repState == WAIT_UP && smoothAz > SQUAT_UP_THR) {
+      if (now - lastRepTime > MIN_REP_MS) { repCount++; lastRepTime = now; counted = true; }
+      repState = WAIT_DOWN;
     }
   }
 
@@ -267,16 +291,15 @@ void loop() {
   // Row 0 — mode
   display.setTextSize(1);
   display.setCursor(0, 0);
-  display.print(mode == PUSHUP ? " >> PUSH-UP <<" : " >>  SIT-UP <<");
+  display.print(modeLabel());
 
-  // Row 1 — connection status (always visible, refreshes every loop)
+  // Row 1 — connection status
   display.setCursor(0, 10);
   display.printf("W:%s M:%s  %s",
                  wifiOk ? "OK" : "--",
                  mqttOk ? "OK" : "--",
                  deviceId.c_str());
 
-  // Divider
   display.drawFastHLine(0, 20, 128, SSD1306_WHITE);
 
   // Row 2 — rep counter (size 3, centred)
@@ -286,18 +309,18 @@ void loop() {
   display.setCursor(cx, 23);
   display.print(repCount);
 
-  // Divider
   display.drawFastHLine(0, 49, 128, SSD1306_WHITE);
 
   // Row 3 — sensor + wait state
   display.setTextSize(1);
   display.setCursor(0, 52);
-  if (mode == PUSHUP) {
+  if (mode == SITUP) {
+    display.printf("ay:%.2f  wait:%s", smoothAy,
+                   repState == WAIT_UP ? "UP  " : "DOWN");
+  } else {
+    // PUSHUP and SQUAT both use az
     display.printf("az:%.2f  wait:%s", smoothAz,
                    repState == WAIT_DOWN ? "DOWN" : "UP  ");
-  } else {
-    display.printf("ay:%.2f  wait:%s", smoothAy,
-                   repState == WAIT_UP   ? "UP  " : "DOWN");
   }
 
   display.display();
